@@ -1,5 +1,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
+#include <libavutil/opt.h>
 }
 
 #include "RingBuffer.h"
@@ -10,26 +12,36 @@ extern "C" {
 using std::thread;
 
 AVFormatContext * formatCtx = NULL;
-const char * fileName = "/Users/zj-db0731/Downloads/testVideos/test2.mp4";
+const char * fileName = "/Users/zj-db0731/Downloads/testVideos/480x854.m4v";
 AVCodecContext * audioDecCtx = NULL;
 int audioStreamIndex;
 AVFrame *frame = NULL;
-AVPacket pkt;
-int numBytePerSample;
-int numChannel;
-int sampleRate;
 
 
-ALCdevice * alDev;
-ALCcontext * alCtx;
+
+ALCdevice * alDev = NULL;
+ALCcontext * alCtx = NULL;
 ALuint alSource;
 ALuint alBuffers[3];
 ALenum alFormat;
 
-void * audioFrame;
+void * audioFrame = NULL;
 int audioFrameSize;
 
-RingBuffer * rBuf;
+#define TARGET_SAMPLE_RATE 44100
+#define TARGET_CHANNEL_LAYOUT AV_CH_LAYOUT_MONO
+#define TARGET_SAMPLE_FORMAT AV_SAMPLE_FMT_S16
+#define MAX_SAMPLES_IN_TARGET_BUFFER TARGET_SAMPLE_RATE //1秒
+
+struct SwrContext *swr_ctx = NULL;
+int targetChannelCount = 0;
+int targetNumBytePerSample = 0;
+void * targetAudioBuffer = NULL;
+int targetAudioBufferSize = 0;
+
+RingBuffer * rBuf = NULL;
+
+
 
 void initFFmpeg()
 {
@@ -43,11 +55,7 @@ void initFFmpeg()
         exit(1);
     }
     
-    audioDecCtx = avcodec_alloc_context3(NULL);
-    if(audioDecCtx == NULL) {
-        fprintf(stderr, "alloc codec_context return null\n");
-        exit(1);
-    }
+    
     
     audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if(audioStreamIndex < 0) {
@@ -62,72 +70,93 @@ void initFFmpeg()
         exit(1);
     }
     
+    audioDecCtx = avcodec_alloc_context3(NULL);
+    if(audioDecCtx == NULL) {
+        fprintf(stderr, "alloc codec_context return null\n");
+        exit(1);
+    }
+    
     if (avcodec_parameters_to_context(audioDecCtx, audioStream->codecpar) < 0) {
         fprintf(stderr, "Failed to copy codec parameters to decoder context\n");
         exit(1);
     }
     
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "refcounted_frames", 0,0);
+    int ret = av_dict_set(&opts, "refcounted_frames", "0",0);
+    if(ret < 0) {
+        printf("av_dict_set_refcounted_frames failed");
+        exit(1);
+    }
     if (avcodec_open2(audioDecCtx, dec, NULL) < 0) {
         fprintf(stderr, "Failed to open codec\n");
         exit(1);
     }
     
-    if(av_sample_fmt_is_planar(audioDecCtx->sample_fmt)) {
-        //todo: use libswresample or libavfilter to convert the frame to packed data
-        fprintf(stderr, "planar data is not supported at present\n");
-        exit(1);
-    }
+    
+    
 }
 
 void audioLoop()
 {
     for(int i=0;i<3;++i) {
         rBuf->read((unsigned char *)audioFrame, 0, audioFrameSize);
-        alBufferData(alBuffers[0], alFormat, audioFrame, audioFrameSize, sampleRate);
+        alBufferData(alBuffers[0], alFormat, audioFrame, audioFrameSize, TARGET_SAMPLE_RATE);
     }
     alSourceQueueBuffers(alSource, 3, alBuffers);
     alSourcePlay(alSource);
+    
+    ALuint unqueuedBuffer;
+    ALint val;
     while(true) {
+        alGetSourcei(alSource, AL_BUFFERS_PROCESSED, &val);
+        while(val--) {
+            alSourceUnqueueBuffers(alSource, 1, &unqueuedBuffer);
+            rBuf->read((unsigned char *)audioFrame, 0, audioFrameSize);
+            alBufferData(unqueuedBuffer, alFormat, audioFrame, audioFrameSize, TARGET_SAMPLE_RATE);
+        }
         
     }
 }
 
 void initAL()
 {
+    if(av_sample_fmt_is_planar(TARGET_SAMPLE_FORMAT)) {
+        printf("openal do not support planar data");
+        exit(1);
+    }
+    
     alDev = alcOpenDevice(NULL);
     if(!alDev) {
-        
+        printf("alcOpenDevice failed");
     }
     
     alCtx = alcCreateContext(alDev, NULL);
     alcMakeContextCurrent(alCtx);
     if(!alCtx) {
-        
+        printf("alcMakeContextCurrent failed");
     }
     
     alGenBuffers(3, alBuffers);
     alGenSources(1, &alSource);
     if(alGetError() != AL_NO_ERROR) {
-        
+        printf("alGenBuffers\alGenSources failed");
     }
     
-    if(numBytePerSample == 1) {
-        if(numChannel == 1) {
+    
+    if(targetNumBytePerSample == 1) {
+        if(targetChannelCount == 1) {
             alFormat = AL_FORMAT_MONO8;
         }
-        else if(numChannel == 2) {
+        else if(targetChannelCount == 2) {
             alFormat = AL_FORMAT_STEREO8;
         }
     }
-    else if(numBytePerSample ==2) {
-        if(numChannel == 1) {
+    else if(targetNumBytePerSample ==2) {
+        if(targetChannelCount == 1) {
             alFormat = AL_FORMAT_MONO16;
         }
-        else if(numChannel == 2) {
+        else if(targetChannelCount == 2) {
             alFormat = AL_FORMAT_STEREO16;
-            
         }
     }
     else {
@@ -145,42 +174,109 @@ void initAL()
 
 void releaseAL()
 {
-    
 }
 
 
 int main()
 {
-    rBuf = new RingBuffer(2048,RingBuffer::READ_MODE_BLOCK,RingBuffer::WRITE_MODE_BLOCK);
-
+    rBuf = new RingBuffer(4096,RingBuffer::READ_MODE_BLOCK,RingBuffer::WRITE_MODE_BLOCK);
+    
+    targetChannelCount = av_get_channel_layout_nb_channels(TARGET_CHANNEL_LAYOUT);
+    targetNumBytePerSample = av_get_bytes_per_sample(TARGET_SAMPLE_FORMAT);
+    targetAudioBufferSize = MAX_SAMPLES_IN_TARGET_BUFFER * targetChannelCount * targetNumBytePerSample;
+    targetAudioBuffer = malloc(targetAudioBufferSize);
+    
+    
     initFFmpeg();
     
-    sampleRate = audioDecCtx->sample_rate;
-    numBytePerSample = av_get_bytes_per_sample(audioDecCtx->sample_fmt);
-    numChannel = audioDecCtx->channels;
-    audioFrameSize = sampleRate * numBytePerSample * numChannel;
+    int sampleRate = audioDecCtx->sample_rate;
+    int numChannel = audioDecCtx->channels;
+    AVSampleFormat sampleFormat = audioDecCtx->sample_fmt;
+    
+    
+    if(sampleRate != TARGET_SAMPLE_RATE ||
+       audioDecCtx->sample_fmt != TARGET_SAMPLE_FORMAT ||
+       audioDecCtx->channels != targetChannelCount) {
+        swr_ctx = swr_alloc();
+        if(!swr_ctx) {
+            printf("Could not allocate resampler context\n");
+            exit(1);
+        }
+        av_opt_set_int(swr_ctx,"in_channel_layout",av_get_default_channel_layout(numChannel),0);
+        av_opt_set_int(swr_ctx, "in_sample_rate", sampleRate, 0);
+        av_opt_set_int(swr_ctx,"in_sample_fmt",sampleFormat,0);
+        
+        av_opt_set_int(swr_ctx, "out_channel_layout",TARGET_CHANNEL_LAYOUT,0);
+        av_opt_set_int(swr_ctx, "out_sample_rate",TARGET_SAMPLE_RATE, 0);
+        av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt",TARGET_SAMPLE_FORMAT, 0);
+        
+        if(swr_init(swr_ctx) < 0) {
+            printf("Failed to initialize the resampling context\n");
+            exit(1);
+        }
+    }
+    
+    audioFrameSize = TARGET_SAMPLE_RATE * av_get_bytes_per_sample(TARGET_SAMPLE_FORMAT) * targetChannelCount;
     audioFrame = malloc(audioFrameSize);
     
     initAL();
     
+    
     int got_frame = 0;
+    
+    AVPacket pkt;
+    av_init_packet(&pkt);
+    pkt.data = NULL;
+    pkt.size = 0;
+    frame = av_frame_alloc();
+    
     while(av_read_frame(formatCtx, &pkt) >= 0) {
         AVPacket orig_pkt = pkt;
+        if(pkt.stream_index != audioStreamIndex) {
+            av_packet_unref(&orig_pkt);
+            continue;
+        }
+        
         do {
             got_frame = 0;
             int ret;
             if((ret = avcodec_decode_audio4(audioDecCtx, frame, &got_frame, &pkt)) < 0) {
-                
+                printf("avcodec_decode_audio4 failed:%s\n",av_err2str(ret));
+                break;
             }
             ret = FFMIN(ret, pkt.size);
+            pkt.data += ret;
+            pkt.size -= ret;
             if(got_frame) {
-                uint8_t * data = frame->data[0];
-                int size = frame->linesize[0];
-                
+                if(swr_ctx != NULL) {
+                    if(frame->nb_samples > MAX_SAMPLES_IN_TARGET_BUFFER) {
+                        printf("target buffer too small");
+                    }
+                    
+                    int ret = swr_convert(swr_ctx,(uint8_t **)(&targetAudioBuffer),MAX_SAMPLES_IN_TARGET_BUFFER,(const uint8_t **)(frame->data),frame->nb_samples);
+                    
+                    if(ret < 0) {
+                        printf("swr_convert failed\n");
+                        exit(1);
+                    }
+                    int size = av_samples_get_buffer_size(NULL,targetChannelCount,frame->nb_samples,TARGET_SAMPLE_FORMAT,1);
+                    if(size < 0) {
+                        printf("av_samples_get_buffer_size failed\n");
+                        exit(1);
+                    }
+                    rBuf->write((unsigned char *)targetAudioBuffer, 0, size);
+                }
+                else {
+                    uint8_t * data = frame->data[0];
+                    int size = frame->linesize[0];
+                    rBuf->write(data, 0, size);
+                }
             }
             
         }while(pkt.size > 0);
         av_packet_unref(&orig_pkt);
     }
+    
+    
     
 }
